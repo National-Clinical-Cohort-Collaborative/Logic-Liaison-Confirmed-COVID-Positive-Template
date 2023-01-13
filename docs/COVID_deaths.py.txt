@@ -1,0 +1,67 @@
+#* COVID_deaths:
+#*   desc: finds death concepts
+#*   ext: py
+#*   inputs:
+#*   - death
+#*   - COHORT
+#*   - microvisit_to_macrovisit_lds
+#*   - concept_set_members
+#* 
+
+#Purpose - The purpose of this pipeline is to produce a day level and a persons level fact table for the confirmed (positive COVID PCR or AG lab test or U07.1 diagnosis charted) COVID positive patients in the N3C enclave.
+#Creator/Owner/contact - Andrea Zhou
+#Last Update - 12/7/22
+#Description - This node filters the visits table for rows that have a discharge_to_concept_id that corresponds with the DECEASED or HOSPICE concept sets and combines these records with the patients in the deaths table. Death dates are taken from the deaths table and the visits table if the patient has a discharge_to_concept_id that corresponds with the DECEASED concept set. No date is retained for patients who were discharged to hospice. The node then drops any duplicates from this combined table, finds the earliest available death_date for each patient, and creates a flag for whether a patient has died.
+
+def COVID_deaths(death, COHORT, microvisit_to_macrovisit_lds, concept_set_members):
+ 
+    persons = COHORT.select('person_id', 'data_extraction_date')
+    concepts_df = concept_set_members \
+        .select('concept_set_name', 'is_most_recent_version', 'concept_id') \
+        .where(F.col('is_most_recent_version')=='true')
+    visits_df = microvisit_to_macrovisit_lds \
+        .select('person_id','visit_end_date','discharge_to_concept_id') \
+        .withColumnRenamed('visit_end_date','death_date')
+    death_df = death \
+        .select('person_id', 'death_date') \
+        .distinct()
+
+    #create lists of concept ids to look for in the discharge_to_concept_id column of the visits_df
+    death_from_visits_ids = list(concepts_df.where(F.col('concept_set_name') == "DECEASED").select('concept_id').toPandas()['concept_id'])
+    hospice_from_visits_ids = list(concepts_df.where(F.col('concept_set_name') == "HOSPICE").select('concept_id').toPandas()['concept_id'])
+
+    #filter visits table to patient and date rows that have DECEASED that matches list of concept_ids
+    death_from_visits_df = visits_df \
+        .where(F.col('discharge_to_concept_id').isin(death_from_visits_ids)) \
+        .drop('discharge_to_concept_id') \
+        .distinct()
+    #filter visits table to patient rows that have DECEASED that matches list of concept_ids
+    hospice_from_visits_df = visits_df.drop('death_date') \
+        .where(F.col('discharge_to_concept_id').isin(hospice_from_visits_ids)) \
+        .drop('discharge_to_concept_id') \
+        .distinct()
+
+    ###combine relevant visits sourced deaths from deaths table deaths###
+
+    #joining in deaths from visits table to deaths table
+    #join in patients, without any date, for HOSPICE
+    #inner join to persons to only keep info related to desired cohort
+    df = death_df.join(death_from_visits_df, on=['person_id', 'death_date'], how='outer') \
+        .join(hospice_from_visits_df, on='person_id', how='outer') \
+        .join(persons, on='person_id', how='inner')
+        
+    #collapse to unique person and find earliest date the patient expired or was discharge to hospice 
+    df = df.groupby('person_id').agg(
+        F.min('death_date').alias('date'),
+        F.max('data_extraction_date').alias('data_extraction_date'))
+    
+    df = df.withColumn("COVID_patient_death", F.lit(1))
+    
+    return df
+        
+
+#################################################
+## Global imports and functions included below ##
+#################################################
+
+from pyspark.sql import functions as F

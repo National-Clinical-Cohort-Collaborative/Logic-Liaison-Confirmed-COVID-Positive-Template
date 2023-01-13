@@ -1,0 +1,100 @@
+#* visits_of_interest:
+#*   desc: finds ED and hosp visit concepts within desired timeframe
+#*   ext: py
+#*   inputs:
+#*   - COHORT
+#*   - microvisit_to_macrovisit_lds
+#*   - concept_set_members
+#* 
+
+#Purpose - The purpose of this pipeline is to produce a visit day level and a persons level fact table for the confirmed (positive COVID PCR or AG lab test or U07.1 diagnosis charted) COVID positive patients in the N3C enclave.
+#Creator/Owner/contact - Andrea Zhou
+#Last Update - 5/3/22
+#Description - This node queries the microvisits_to_macrovisits table to identify hospitalizations.  The input table can be changed to the visits table if indicated, but the code in the transform would need to be modified accordingly.  The parameter called covid_associated_hospitalization_requires_lab_AND_diagnosis is created and allows the user to easily change whether they define COVID-19 associated ED visits and hospitalizations using the CDC definition (lab positive with a COVID-19 diagnosis charted) OR using anyone who is either lab positive or has a COVID-19 diagnosis charted.  Number of days between a patient’s diagnosis date and their positive lab result is also calculated in this node.
+
+def visits_of_interest(COHORT, microvisit_to_macrovisit_lds, concept_set_members):
+    
+    #select test/dx date columns for cohort patients and add column for date diff between positive lab test and COVID diagnosis when available
+    persons = COHORT \
+        .select('person_id', 'COVID_first_PCR_or_AG_lab_positive', 'COVID_first_diagnosis_date', 'COVID_first_poslab_or_diagnosis_date') \
+        .withColumn('lab_minus_diagnosis_date', F.datediff('COVID_first_PCR_or_AG_lab_positive','COVID_first_diagnosis_date'))
+    #filter macrovisit table to only cohort patients    
+    df = microvisit_to_macrovisit_lds \
+        .select('person_id','visit_start_date','visit_concept_id','macrovisit_start_date','macrovisit_end_date') \
+        .join(persons,'person_id','inner')  
+
+    concepts_df = concept_set_members \
+        .select('concept_set_name', 'is_most_recent_version', 'concept_id') \
+        .where(F.col('is_most_recent_version')=='true')  
+
+    # use macrovisit table to find ED only visits (that do not lead to hospitalization)   
+    ED_concept_ids = list(concepts_df.where((concepts_df.concept_set_name=="[PASC] ED Visits") & (concepts_df.is_most_recent_version=='true')).select('concept_id').toPandas()['concept_id'])
+    df_ED = df.where(df.macrovisit_start_date.isNull()&(df.visit_concept_id.isin(ED_concept_ids)))
+    df_ED = df_ED.withColumn('lab_minus_ED_visit_start_date', F.datediff('COVID_first_PCR_or_AG_lab_positive','visit_start_date'))
+    
+    """
+    create parameter for toggling COVID-19 related ED only visit and hospital admission definitions
+    when parameter =True: Per CDC definitions of a COVID-19 associated ED or hospital admission visit, ensure that a COVID-19 diagnosis and ED/hospital admission occurred in the 16 days after or 1 day prior to the PCR or AG positive test (index event).
+    when parameter =False: ED or hospital admission visits flagged based on the first instance of a positive COVID-19 PCR or AG lab result OR the first instance of a charted COVID-19 diagnosis when there is no positive lab result within specified timeframe of ED/hospital admission.
+    """
+    covid_associated_ED_or_hosp_requires_lab_AND_diagnosis = True
+    num_days_before_index = 1
+    num_days_after_index = 16
+    
+
+    if covid_associated_ED_or_hosp_requires_lab_AND_diagnosis:
+        df_ED = (df_ED.withColumn('covid_pcr_or_ag_associated_ED_only_visit', F.when(F.col('lab_minus_ED_visit_start_date').between(-num_days_after_index,num_days_before_index), 1).otherwise(0))
+                .withColumn('COVID_lab_positive_and_diagnosed_ED_visit', F.when((F.col('covid_pcr_or_ag_associated_ED_only_visit')==1) & (F.col('lab_minus_diagnosis_date').between(-num_days_after_index,num_days_before_index)), 1).otherwise(0))
+                .where(F.col('COVID_lab_positive_and_diagnosed_ED_visit')==1)
+                .withColumnRenamed('visit_start_date','covid_ED_only_start_date')
+                .select('person_id', 'covid_ED_only_start_date')
+                .dropDuplicates())
+    else:
+        df_ED = df_ED.withColumn("earliest_index_minus_ED_start_date", F.datediff("COVID_first_poslab_or_diagnosis_date","visit_start_date"))
+        #first lab or diagnosis date based, ED only visit
+        df_ED = (df_ED.withColumn("covid_lab_or_dx_associated_ED_only_visit", F.when(F.col('earliest_index_minus_ED_start_date').between(-num_days_after_index,num_days_before_index), 1).otherwise(0))
+                .where(F.col('covid_lab_or_dx_associated_ED_only_visit')==1)
+                .withColumnRenamed('visit_start_date','covid_ED_only_start_date')
+                .select('person_id', 'covid_ED_only_start_date' )
+                .dropDuplicates())
+   
+    # use macrovisit table to find visits associated with hospitalization
+    df_hosp = df.where(df.macrovisit_start_date.isNotNull())
+    df_hosp = df_hosp.withColumn("lab_minus_hosp_start_date", F.datediff("COVID_first_PCR_or_AG_lab_positive","macrovisit_start_date")) 
+
+    if covid_associated_ED_or_hosp_requires_lab_AND_diagnosis:
+        df_hosp = (df_hosp.withColumn("covid_pcr_or_ag_associated_hospitalization", F.when(F.col('lab_minus_hosp_start_date').between(-num_days_after_index,num_days_before_index), 1).otherwise(0))
+                .withColumn("COVID_lab_positive_and_diagnosed_hospitalization", F.when((F.col('covid_pcr_or_ag_associated_hospitalization')==1) & (F.col('lab_minus_diagnosis_date').between(-num_days_after_index,num_days_before_index)), 1).otherwise(0))
+                .where(F.col('COVID_lab_positive_and_diagnosed_hospitalization')==1)
+                .withColumnRenamed('macrovisit_start_date','covid_hospitalization_start_date')
+                .withColumnRenamed('macrovisit_end_date','covid_hospitalization_end_date')
+                .select('person_id', 'covid_hospitalization_start_date', 'covid_hospitalization_end_date')
+                .dropDuplicates())
+    else:
+        df_hosp = df_hosp.withColumn("earliest_index_minus_hosp_start_date", F.datediff("COVID_first_poslab_or_diagnosis_date","macrovisit_start_date")) 
+
+        #first lab or diagnosis date based, hospitalization visit
+        df_hosp = (df_hosp.withColumn("covid_lab_or_diagnosis_associated_hospitilization", F.when(F.col('earliest_index_minus_hosp_start_date').between(-num_days_after_index,num_days_before_index), 1).otherwise(0))
+                .where(F.col('covid_lab_or_diagnosis_associated_hospitilization')==1)
+                .withColumnRenamed('macrovisit_start_date','covid_hospitalization_start_date')
+                .withColumnRenamed('macrovisit_end_date','covid_hospitalization_end_date')
+                .select('person_id', 'covid_hospitalization_start_date', 'covid_hospitalization_end_date')
+                .dropDuplicates())
+ 
+    #join ED and hosp dataframes
+    df = df.join(df_ED,'person_id', 'outer')
+    df = df.join(df_hosp,'person_id', 'outer')
+    
+    #collapse all values to one row per person
+    df = df.groupby('person_id').agg(
+    F.min('covid_ED_only_start_date').alias('first_COVID_ED_only_start_date'),
+    F.min('covid_hospitalization_start_date').alias('first_COVID_hospitalization_start_date'),
+    F.min('covid_hospitalization_end_date').alias('first_COVID_hospitalization_end_date'))
+
+    return df
+    
+#################################################
+## Global imports and functions included below ##
+#################################################
+
+from pyspark.sql import functions as F

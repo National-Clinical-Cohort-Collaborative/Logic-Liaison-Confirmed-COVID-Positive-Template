@@ -1,0 +1,25 @@
+#* customize_concept_sets:
+#*   desc: combines the two fusion inputs
+#*   ext: py
+#*   inputs:
+#*   - LL_concept_sets_fusion
+#*   - LL_DO_NOT_DELETE_REQUIRED_concept_sets_confirmed
+#* 
+
+#Description - The purpose of this node is to optimize the user's experience connecting a customized concept set "fusion sheet" input data frame to replace LL_concept_sets_fusion_SNOMED.
+
+def customize_concept_sets(LL_concept_sets_fusion, LL_DO_NOT_DELETE_REQUIRED_concept_sets_confirmed):
+
+    required = LL_DO_NOT_DELETE_REQUIRED_concept_sets_confirmed
+    customizable = LL_concept_sets_fusion
+    
+    df = required.join(customizable, on = required.columns, how = 'outer')
+    
+    return df
+    
+
+#################################################
+## Global imports and functions included below ##
+#################################################
+
+from pyspark.sql import functions as F

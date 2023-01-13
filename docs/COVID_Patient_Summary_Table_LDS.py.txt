@@ -1,0 +1,106 @@
+#* COVID_Patient_Summary_Table_LDS:
+#*   desc: creates summary table with one row per patient
+#*   ext: py
+#*   inputs:
+#*   - cohort_all_facts_table
+#*   - COHORT
+#*   - visits_of_interest
+#*   - COVID_deaths
+#*   - customize_concept_sets
+#*   - Sdoh_variables_all_patients
+#* 
+
+#Purpose - The purpose of this pipeline is to produce a day level and a persons level fact table for the confirmed (positive COVID PCR or AG lab test or U07.1 diagnosis charted) COVID positive patients in the N3C enclave.
+#Creator/Owner/contact - Andrea Zhou
+#Last Update - 12/7/22
+#Description - The final step is to aggregate information to create a data frame that contains a single row of data for each patient in the cohort.  This node aggregates all information from the cohort_all_facts_table and summarizes each patient's facts in a single row.  The patient’s hospitalization length of stay is calculated in this node.  For patients with ED visits and/or hospitalizations concurrent with their positive COVID-19 index date, indicators are created in this node. This transformation then joins the before or day of COVID, during hospitalization, and post COVID indicator data frames on the basis of unique patients.
+
+def COVID_Patient_Summary_Table_LDS(cohort_all_facts_table, COHORT, visits_of_interest, COVID_deaths, customize_concept_sets, Sdoh_variables_all_patients):
+
+    SDOH_vars = Sdoh_variables_all_patients #dataset not joined in, just referenced here so that it will import with template for easy access if user wants to join to their summary tables
+
+    visits_df = visits_of_interest
+    deaths_df = COVID_deaths.select('person_id','COVID_patient_death')
+    all_facts = cohort_all_facts_table
+    fusion_sheet = customize_concept_sets
+
+    pre_columns = list(
+        fusion_sheet.filter(fusion_sheet.pre_during_post.contains('pre'))
+        .select('indicator_prefix')
+        .distinct().toPandas()['indicator_prefix'])
+    pre_columns.extend(['person_id', 'BMI_rounded', 'Antibody_Pos', 'Antibody_Neg', 'had_vaccine_administered'])
+    during_columns = list(
+        fusion_sheet.filter(fusion_sheet.pre_during_post.contains('during'))
+        .select('indicator_prefix')
+        .distinct().toPandas()['indicator_prefix'])
+    during_columns.extend(['person_id', 'COVID_patient_death'])
+    post_columns = list(
+        fusion_sheet.filter(fusion_sheet.pre_during_post.contains('post'))
+        .select('indicator_prefix')
+        .distinct().toPandas()['indicator_prefix'])
+    post_columns.extend(['person_id', 'BMI_rounded', 'PCR_AG_Pos', 'PCR_AG_Neg', 'Antibody_Pos', 'Antibody_Neg', 'is_first_reinfection', 'had_vaccine_administered'])
+
+    df_pre_COVID = all_facts \
+        .where(all_facts.pre_COVID==1) \
+        .select(list(set(pre_columns) & set(all_facts.columns)))
+    df_during_COVID_hospitalization = all_facts \
+        .where(all_facts.during_first_COVID_hospitalization==1) \
+        .select(list(set(during_columns) & set(all_facts.columns)))
+    df_post_COVID = all_facts \
+        .where(all_facts.post_COVID==1) \
+        .select(list(set(post_columns) & set(all_facts.columns)))
+   
+    df_pre_COVID = df_pre_COVID.groupby('person_id').agg(
+        F.max('BMI_rounded').alias('BMI_max_observed_or_calculated_before_or_day_of_covid'),
+        *[F.max(col).alias(col + '_before_or_day_of_covid_indicator') for col in df_pre_COVID.columns if col not in ('person_id', 'BMI_rounded', 'had_vaccine_administered')],
+        F.sum('had_vaccine_administered').alias('number_of_COVID_vaccine_doses_before_or_day_of_covid'))
+    
+    df_during_COVID_hospitalization = df_during_COVID_hospitalization.groupby('person_id').agg(
+        *[F.max(col).alias(col + '_during_covid_hospitalization_indicator') for col in df_during_COVID_hospitalization.columns if col not in ('person_id')])
+
+    df_post_COVID = df_post_COVID.groupby('person_id').agg(
+        F.max('BMI_rounded').alias('BMI_max_observed_or_calculated_post_covid'),
+        *[F.max(col).alias(col + '_post_covid_indicator') for col in df_post_COVID.columns if col not in ('person_id', 'BMI_rounded', 'is_first_reinfection', 'had_vaccine_administered')],
+        F.sum('had_vaccine_administered').alias('number_of_COVID_vaccine_doses_post_covid'),
+        F.max('is_first_reinfection').alias('had_at_least_one_reinfection_post_covid_indicator'))
+
+    #join above three tables on patient ID 
+    df = df_pre_COVID.join(df_during_COVID_hospitalization, 'person_id', 'outer')
+    df = df.join(df_post_COVID, 'person_id', 'outer')
+    
+    df = df.join(visits_df,'person_id', 'outer')
+
+    #already dependent on decision made in visits of interest node, no changes necessary here
+    df = df.withColumn('COVID_hospitalization_length_of_stay', 
+        F.datediff("first_COVID_hospitalization_end_date", "first_COVID_hospitalization_start_date"))
+
+    df = df.withColumn('COVID_associated_ED_only_visit_indicator', 
+        F.when(df.first_COVID_ED_only_start_date.isNotNull(), 1).otherwise(0)) 
+    df = df.withColumn('COVID_associated_hospitalization_indicator', 
+        F.when(df.first_COVID_hospitalization_start_date.isNotNull(), 1).otherwise(0)) 
+    
+    #join back in generic death flag for any patient with or without a date
+    df = df.join(deaths_df, 'person_id', 'left').withColumnRenamed('COVID_patient_death', 'COVID_patient_death_indicator')
+    #join back in death within fixed window post covid for patients with a date to use in severity of index infection
+    df = df.join(all_facts.select('person_id','death_within_specified_window_post_covid').where(F.col('death_within_specified_window_post_covid')==1), 'person_id', 'left')
+    #join in demographics and manifest data from cohort node
+    df = COHORT.join(df, 'person_id','left')
+    
+    df = df.na.fill(value=0, subset = [col for col in df.columns if col not in ('BMI_max_observed_or_calculated_before_or_day_of_covid','BMI_max_observed_or_calculated_post_covid', 'postal_code', 'age_at_covid')])
+
+    df = df.withColumn("Severity_Type", 
+        F.when((df.COVID_first_PCR_or_AG_lab_positive.isNull() & df.COVID_first_diagnosis_date.isNull()), "No_COVID_index")
+        .when((df.death_within_specified_window_post_covid == 1), "Death_within_n_days_after_COVID_index")
+        .when((df.LL_ECMO_during_covid_hospitalization_indicator == 1) | (df.LL_IMV_during_covid_hospitalization_indicator == 1), "Severe_ECMO_IMV_in_Hosp_around_COVID_index")
+        .when(df.first_COVID_hospitalization_start_date.isNotNull(), "Moderate_Hosp_around_COVID_index")
+        .when(df.first_COVID_ED_only_start_date.isNotNull(), "Mild_ED_around_COVID_index")
+        .otherwise("Mild_No_ED_or_Hosp_around_COVID_index"))
+
+    
+    return df
+        
+#################################################
+## Global imports and functions included below ##
+#################################################
+
+from pyspark.sql import functions as F
