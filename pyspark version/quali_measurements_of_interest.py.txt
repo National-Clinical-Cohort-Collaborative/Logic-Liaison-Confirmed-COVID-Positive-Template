@@ -1,0 +1,120 @@
+#* quali_measurements_of_interest:
+#*   desc: finds qualitative measurement concepts
+#*   ext: py
+#*   inputs:
+#*   - measurement
+#*   - concept_set_members
+#*   - COHORT
+#*   - customize_concept_sets
+#* 
+
+#Purpose - The purpose of this pipeline is to produce a day level and a persons level fact table for the confirmed (positive COVID PCR or AG lab test or U07.1 diagnosis charted) COVID positive patients in the N3C enclave.
+#Creator/Owner/contact - Andrea Zhou
+#Last Update - 11/20/24
+#Description - This node filters the measurements table for rows that have a measurement_concept_id associated with one of the concept sets described in the above data dictionary. Then it finds the value as concept id for the qualitative measurements (positive and negative lab results) and collapses these to unique instances on the basis of patient and date.
+
+def quali_measurements_of_interest(measurement, concept_set_members, COHORT, customize_concept_sets):
+    
+    #bring in only cohort patient ids
+    persons = COHORT.select('person_id')
+         
+    #filter measurements table to only cohort patients and rows with harmonized values   
+    measurement_df = measurement \
+        .select('person_id','measurement_date','measurement_concept_id','harmonized_value_as_number', 'value_as_number', 'value_as_concept_id','harmonized_unit_concept_id') \
+        .where(F.col('measurement_date').isNotNull()) \
+        .withColumnRenamed('measurement_date','date') \
+        .withColumnRenamed('measurement_concept_id','concept_id') \
+        .join(persons, 'person_id', 'inner') 
+    
+    #filter fusion sheet for concept sets and their future variable names that have concepts in the measurements domain
+    fusion_df = customize_concept_sets \
+        .filter(customize_concept_sets.domain.contains('measurement')) \
+        .filter(customize_concept_sets["lower_bound"] == "qual") \
+        .select('concept_set_name', 'codeset_id', 'indicator_prefix', 'lower_bound', 'upper_bound')
+    
+    concept_members_df = concept_set_members 
+
+    codeset_id = False
+    #filter concept set members table to only concept ids for the measurements of interest
+    #prioritize codeset_id
+    if codeset_id == True:
+        #create concepts_df from codeset_id
+        concepts_df_id = concept_members_df \
+            .select('concept_id', 'codeset_id') \
+            .join(fusion_df, 'codeset_id', 'inner') \
+            .select('concept_id','indicator_prefix', 'lower_bound', 'upper_bound')
+
+        #create concepts_df from concept_set_name
+        concepts_df_name = concept_members_df \
+            .select('concept_set_name', 'is_most_recent_version', 'concept_id') \
+            .where((F.col('is_most_recent_version')=='true')) \
+            .join(fusion_df.where(F.col('codeset_id').isNull()), 'concept_set_name', 'inner') \
+            .select('concept_id','indicator_prefix', 'lower_bound', 'upper_bound')
+
+        concepts_df = concepts_df_name.join(concepts_df_id, ['concept_id', 'indicator_prefix', 'concept_set_name', 'is_most_recent_version', 'lower_bound', 'upper_bound'], 'outer')
+
+    #use only concept_set_name
+    else:
+        concepts_df = concept_members_df \
+            .select('concept_set_name', 'is_most_recent_version', 'concept_id') \
+            .where(F.col('is_most_recent_version')=='true') \
+            .join(fusion_df, 'concept_set_name', 'inner') \
+            .select('concept_id','indicator_prefix', 'concept_set_name', 'is_most_recent_version', 'lower_bound', 'upper_bound')
+    
+    ## Generate Test Result list from concepts_df
+    positive_measurement_ids = (
+    concepts_df
+    .filter(concepts_df.indicator_prefix == 'Pos_Value')
+    .select('concept_id')
+    .rdd.flatMap(lambda x: x)
+    .collect())
+    negative_measurement_ids = (
+    concepts_df
+    .filter(concepts_df.indicator_prefix == 'Neg_Value')
+    .select('concept_id')
+    .rdd.flatMap(lambda x: x)
+    .collect())
+
+    ## Find measurements information based on matching concept ids for harmonized measurements of interest AND add units for the corresponding measurements
+    df = measurement_df.join(concepts_df, 'concept_id', 'inner') \
+        .select('person_id', 'date', 'indicator_prefix', 'value_as_concept_id')
+        
+    
+    ## Split Measurement fields into Pos and Neg
+    for indicator in df.select("indicator_prefix").distinct().collect():
+        prefix = indicator['indicator_prefix']
+        pos_column = f"{prefix}_Pos"
+        neg_column = f"{prefix}_Neg"
+
+        # Create _Pos columns: 1 if value_as_concept_id exists in positive_measurement_ids, 0 otherwise
+        df = df.withColumn(
+            pos_column, 
+            F.when(df["value_as_concept_id"].isin(positive_measurement_ids), 1).otherwise(0)
+        )
+    
+        # Create _Neg columns: 1 if value_as_concept_id exists in negative_measurement_ids, 0 otherwise
+        df = df.withColumn(
+            neg_column, 
+            F.when(df["value_as_concept_id"].isin(negative_measurement_ids), 1).otherwise(0)
+        )
+
+    ## List of columns ending with '_Pos' or '_Neg'
+    columns_to_agg = [col for col in df.columns if col.endswith('_Pos') or col.endswith('_Neg')]
+
+    ## Aggregation logic: for each column, take the max value (as it will be 0 or 1)
+    aggregations = {col: F.max(col).alias(col) for col in columns_to_agg}
+
+    ## Collapse to unique person and date with the concept sets for measurements of interest
+    df = df.groupBy("person_id", "date").agg(
+        *[aggregations[col] for col in columns_to_agg]
+    )
+
+    return df
+
+#################################################
+## Global imports and functions included below ##
+#################################################
+
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col
+from pyspark.sql.types import NumericType
